@@ -33,6 +33,24 @@ async function createTables() {
 
 createTables();
 
+async function registerUser(user) {
+  try {
+    await pool.query(
+      `
+      INSERT INTO users (telegram_id, username, first_name)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (telegram_id)
+      DO NOTHING;
+      `,
+      [user.id, user.username || null, user.first_name || null]
+    );
+
+    console.log("User registered or already exists");
+  } catch (error) {
+    console.error("Error registering user:", error);
+  }
+}
+
 const app = express();
 app.use(express.json());
 
