@@ -3,9 +3,21 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
+const SECRET_TOKEN = process.env.SECRET_TOKEN;
+
 app.post("/webhook", async (req, res) => {
+
+    const incomingSecret = req.headers["x-telegram-bot-api-secret-token"];
+
+    // Validación de seguridad
+    if (!incomingSecret || incomingSecret !== SECRET_TOKEN) {
+        console.log("Intento no autorizado");
+        return res.sendStatus(403);
+    }
+
     console.log("Webhook recibido:");
     console.log(JSON.stringify(req.body, null, 2));
+
     res.sendStatus(200);
 });
 
