@@ -12,6 +12,27 @@ pool.connect()
   .catch(err => console.error("DB error:", err));
 const express = require("express");
 
+async function createTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        telegram_id BIGINT UNIQUE NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        subscription_status TEXT DEFAULT 'inactive',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    console.log("Tables ready");
+  } catch (error) {
+    console.error("Error creating tables:", error);
+  }
+}
+
+createTables();
+
 const app = express();
 app.use(express.json());
 
