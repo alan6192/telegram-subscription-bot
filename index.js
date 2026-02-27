@@ -8,13 +8,14 @@ const app = express();
 app.use(express.json());
 
 /* ======================
-   ENV VARIABLES
+   ENV
 ====================== */
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
-let CHANNEL_ID = process.env.CHANNEL_ID || null;
+
+let GROUP_ID = process.env.CHANNEL_ID || null;
 
 /* ======================
    DATABASE
@@ -30,41 +31,41 @@ pool.connect()
 .catch(console.error);
 
 /* ======================
-   TABLES
+   CREATE TABLES
 ====================== */
 
 async function createTables(){
 
 await pool.query(`
 CREATE TABLE IF NOT EXISTS users(
-  id SERIAL PRIMARY KEY,
-  telegram_id BIGINT UNIQUE NOT NULL,
-  username TEXT,
-  first_name TEXT,
-  subscription_status TEXT DEFAULT 'inactive',
-  subscription_end DATE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+id SERIAL PRIMARY KEY,
+telegram_id BIGINT UNIQUE NOT NULL,
+username TEXT,
+first_name TEXT,
+subscription_status TEXT DEFAULT 'inactive',
+subscription_end DATE,
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 `);
 
 await pool.query(`
 CREATE TABLE IF NOT EXISTS subscriptions(
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id),
-  start_date DATE,
-  end_date DATE,
-  status TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+id SERIAL PRIMARY KEY,
+user_id INTEGER REFERENCES users(id),
+start_date DATE,
+end_date DATE,
+status TEXT,
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 `);
 
 await pool.query(`
 CREATE TABLE IF NOT EXISTS payments(
-  id SERIAL PRIMARY KEY,
-  subscription_id INTEGER REFERENCES subscriptions(id),
-  amount NUMERIC,
-  currency TEXT DEFAULT 'USD',
-  paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+id SERIAL PRIMARY KEY,
+subscription_id INTEGER REFERENCES subscriptions(id),
+amount NUMERIC,
+currency TEXT DEFAULT 'USD',
+paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 `);
 
@@ -78,20 +79,20 @@ createTables();
 ====================== */
 
 async function sendMessage(chatId,text){
-  try{
-    await axios.post(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-      { chat_id:chatId,text }
-    );
-  }catch(e){
-    console.error(e.response?.data||e.message);
-  }
+try{
+await axios.post(
+`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+{chat_id:chatId,text}
+);
+}catch(e){
+console.error(e.response?.data||e.message);
+}
 }
 
-async function removeFromChannel(userId){
+async function removeFromGroup(userId){
 
-if(!CHANNEL_ID){
-console.log("CHANNEL_ID not defined");
+if(!GROUP_ID){
+console.log("GROUP_ID missing");
 return;
 }
 
@@ -99,7 +100,7 @@ try{
 await axios.post(
 `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`,
 {
-chat_id:CHANNEL_ID,
+chat_id:GROUP_ID,
 user_id:userId
 });
 }catch(e){
@@ -108,7 +109,7 @@ console.error("Remove error",e.response?.data||e.message);
 }
 
 /* ======================
-   USER REGISTER
+   REGISTER USER
 ====================== */
 
 async function registerUser(user){
@@ -137,14 +138,11 @@ if(!userRes.rowCount) return "User not found";
 
 const userId=userRes.rows[0].id;
 
-/* cerrar anterior */
 await pool.query(`
 UPDATE subscriptions
 SET status='expired'
 WHERE user_id=$1 AND status='active'
 `,[userId]);
-
-/* crear nueva */
 
 const sub=await pool.query(`
 INSERT INTO subscriptions
@@ -162,15 +160,11 @@ RETURNING id,end_date
 const subId=sub.rows[0].id;
 const endDate=sub.rows[0].end_date;
 
-/* payment */
-
 await pool.query(`
 INSERT INTO payments(subscription_id,amount)
 VALUES($1,$2)
 `,
 [subId,amount||0]);
-
-/* snapshot user */
 
 await pool.query(`
 UPDATE users
@@ -216,11 +210,11 @@ Avg Ticket: $${Number(avg.rows[0].avg).toFixed(2)}
    DAILY CHECK
 ====================== */
 
-cron.schedule("0 9 * * *", async()=>{
+cron.schedule("0 9 * * *",async()=>{
 
 console.log("Daily subscription check");
 
-/* avisar vencen hoy */
+/* vencen hoy */
 
 const expiring=await pool.query(`
 SELECT telegram_id,username
@@ -247,7 +241,7 @@ AND subscription_end <= CURRENT_DATE - INTERVAL '3 day'
 
 for(const u of expired.rows){
 
-await removeFromChannel(u.telegram_id);
+await removeFromGroup(u.telegram_id);
 
 await pool.query(`
 UPDATE users
@@ -257,7 +251,7 @@ WHERE id=$1
 
 await sendMessage(
 ADMIN_ID,
-`❌ removido: ${u.telegram_id}`
+`❌ removido por no renovar: ${u.telegram_id}`
 );
 }
 
@@ -269,8 +263,6 @@ ADMIN_ID,
 
 app.post("/webhook",async(req,res)=>{
 
-console.log("Webhook received:",JSON.stringify(req.body));
-
 const incomingSecret=
 req.headers["x-telegram-bot-api-secret-token"];
 
@@ -279,44 +271,35 @@ return res.sendStatus(403);
 
 const update=req.body;
 
+console.log("Webhook received:",JSON.stringify(update));
+
 /* ======================
-   AUTO DETECT CHANNEL ID
+   USER JOIN GROUP
 ====================== */
 
-if(update.my_chat_member){
+if(update.message?.new_chat_members){
 
-const chat=update.my_chat_member.chat;
+const chatId=update.message.chat.id;
 
-if(chat.type==="channel"){
-CHANNEL_ID=chat.id;
-
-console.log("CHANNEL DETECTED:",CHANNEL_ID);
+if(!GROUP_ID){
+GROUP_ID=chatId;
+console.log("GROUP DETECTED:",GROUP_ID);
 
 await sendMessage(
 ADMIN_ID,
-`✅ Channel detected automatically: ${CHANNEL_ID}`
+`✅ Grupo detectado automáticamente: ${GROUP_ID}`
 );
 }
 
-return res.sendStatus(200);
-}
+for(const member of update.message.new_chat_members){
 
-/* ======================
-   USER JOIN CHANNEL
-====================== */
+if(member.is_bot) continue;
 
-if(update.chat_member){
-
-const member=update.chat_member.new_chat_member;
-const user=member.user;
-
-if(member.status==="member"){
-
-await registerUser(user);
+await registerUser(member);
 
 await sendMessage(
 ADMIN_ID,
-`✅ User joined channel: ${user.username||user.id}`
+`✅ Usuario entró: ${member.username||member.id}`
 );
 }
 
@@ -330,7 +313,6 @@ return res.sendStatus(200);
 if(!update.message) return res.sendStatus(200);
 
 const msg=update.message;
-const chatId=msg.chat.id;
 
 if(msg.from.id!==ADMIN_ID)
 return res.sendStatus(200);
@@ -350,14 +332,14 @@ const amount=Number(parts[3]||0);
 const response=
 await renewUser(telegramId,days,amount);
 
-await sendMessage(chatId,response);
+await sendMessage(msg.chat.id,response);
 }
 
 /* stats */
 
 if(text==="/stats"){
 const s=await stats();
-await sendMessage(chatId,s);
+await sendMessage(msg.chat.id,s);
 }
 
 res.sendStatus(200);
