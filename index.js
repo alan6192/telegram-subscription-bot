@@ -14,8 +14,12 @@ app.use(express.json());
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
+const GROUP_ID = process.env.CHANNEL_ID;
 
-let GROUP_ID = process.env.CHANNEL_ID || null;
+if (!BOT_TOKEN || !SECRET_TOKEN || !ADMIN_ID || !GROUP_ID) {
+  console.error("❌ Missing environment variables");
+  process.exit(1);
+}
 
 /* ======================
    DATABASE
@@ -27,49 +31,53 @@ const pool = new Pool({
 });
 
 pool.connect()
-.then(()=>console.log("DB connected"))
-.catch(console.error);
+  .then(() => console.log("✅ DB connected"))
+  .catch(err => {
+    console.error("DB error", err);
+    process.exit(1);
+  });
 
 /* ======================
    CREATE TABLES
 ====================== */
 
-async function createTables(){
+async function createTables() {
 
-await pool.query(`
-CREATE TABLE IF NOT EXISTS users(
-id SERIAL PRIMARY KEY,
-telegram_id BIGINT UNIQUE NOT NULL,
-username TEXT,
-first_name TEXT,
-subscription_status TEXT DEFAULT 'inactive',
-subscription_end DATE,
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-`);
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS users(
+    id SERIAL PRIMARY KEY,
+    telegram_id BIGINT UNIQUE NOT NULL,
+    username TEXT,
+    first_name TEXT,
+    subscription_status TEXT DEFAULT 'pending',
+    subscription_end DATE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  `);
 
-await pool.query(`
-CREATE TABLE IF NOT EXISTS subscriptions(
-id SERIAL PRIMARY KEY,
-user_id INTEGER REFERENCES users(id),
-start_date DATE,
-end_date DATE,
-status TEXT,
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-`);
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS subscriptions(
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    start_date DATE,
+    end_date DATE,
+    status TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  `);
 
-await pool.query(`
-CREATE TABLE IF NOT EXISTS payments(
-id SERIAL PRIMARY KEY,
-subscription_id INTEGER REFERENCES subscriptions(id),
-amount NUMERIC,
-currency TEXT DEFAULT 'USD',
-paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-`);
+  await pool.query(`
+  CREATE TABLE IF NOT EXISTS payments(
+    id SERIAL PRIMARY KEY,
+    subscription_id INTEGER REFERENCES subscriptions(id),
+    method TEXT,
+    amount NUMERIC,
+    currency TEXT DEFAULT 'USD',
+    paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  `);
 
-console.log("Tables ready");
+  console.log("✅ Tables ready");
 }
 
 createTables();
@@ -78,131 +86,139 @@ createTables();
    TELEGRAM HELPERS
 ====================== */
 
-async function sendMessage(chatId,text){
-try{
-await axios.post(
-`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-{chat_id:chatId,text}
-);
-}catch(e){
-console.error(e.response?.data||e.message);
-}
-}
-
-async function removeFromGroup(userId){
-
-if(!GROUP_ID){
-console.log("GROUP_ID missing");
-return;
+async function sendMessage(chatId, text) {
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+      { chat_id: chatId, text }
+    );
+  } catch (e) {
+    console.error("Telegram error:", e.response?.data || e.message);
+  }
 }
 
-try{
-await axios.post(
-`https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`,
-{
-chat_id:GROUP_ID,
-user_id:userId
-});
-}catch(e){
-console.error("Remove error",e.response?.data||e.message);
-}
+async function removeFromGroup(userId) {
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`,
+      { chat_id: GROUP_ID, user_id: userId }
+    );
+  } catch (e) {
+    console.error("Remove error:", e.response?.data || e.message);
+  }
 }
 
 /* ======================
-   REGISTER USER
+   USER REGISTRATION
 ====================== */
 
-async function registerUser(user){
+async function registerUser(user) {
 
-await pool.query(`
-INSERT INTO users(telegram_id,username,first_name)
-VALUES($1,$2,$3)
-ON CONFLICT(telegram_id) DO NOTHING
-`,
-[user.id,user.username||null,user.first_name||null]);
+  await pool.query(`
+    INSERT INTO users(telegram_id, username, first_name)
+    VALUES($1,$2,$3)
+    ON CONFLICT (telegram_id) DO NOTHING
+  `, [user.id, user.username || null, user.first_name || null]);
 
+  await sendMessage(
+    ADMIN_ID,
+    `🆕 Nuevo usuario detectado\n\nID: ${user.id}\nUsername: @${user.username || "N/A"}\n\nUsa:\n/renew ${user.id} 30 20`
+  );
 }
 
 /* ======================
    RENEW SUBSCRIPTION
 ====================== */
 
-async function renewUser(telegramId,days,amount){
+async function renewUser(telegramId, days, amount, method="Manual") {
 
-const userRes=await pool.query(
-`SELECT id FROM users WHERE telegram_id=$1`,
-[telegramId]
-);
+  const userRes = await pool.query(
+    `SELECT id FROM users WHERE telegram_id=$1`,
+    [telegramId]
+  );
 
-if(!userRes.rowCount) return "User not found";
+  if (!userRes.rowCount) return "❌ Usuario no encontrado";
 
-const userId=userRes.rows[0].id;
+  const userId = userRes.rows[0].id;
 
-await pool.query(`
-UPDATE subscriptions
-SET status='expired'
-WHERE user_id=$1 AND status='active'
-`,[userId]);
+  await pool.query(`
+    UPDATE subscriptions
+    SET status='expired'
+    WHERE user_id=$1 AND status='active'
+  `, [userId]);
 
-const sub=await pool.query(`
-INSERT INTO subscriptions
-(user_id,start_date,end_date,status)
-VALUES(
-$1,
-CURRENT_DATE,
-CURRENT_DATE + $2 * INTERVAL '1 day',
-'active'
-)
-RETURNING id,end_date
-`,
-[userId,days]);
+  const sub = await pool.query(`
+    INSERT INTO subscriptions
+    (user_id, start_date, end_date, status)
+    VALUES(
+      $1,
+      CURRENT_DATE,
+      CURRENT_DATE + $2 * INTERVAL '1 day',
+      'active'
+    )
+    RETURNING id, end_date
+  `, [userId, days]);
 
-const subId=sub.rows[0].id;
-const endDate=sub.rows[0].end_date;
+  const subId = sub.rows[0].id;
+  const endDate = sub.rows[0].end_date;
 
-await pool.query(`
-INSERT INTO payments(subscription_id,amount)
-VALUES($1,$2)
-`,
-[subId,amount||0]);
+  await pool.query(`
+    INSERT INTO payments(subscription_id, method, amount)
+    VALUES($1,$2,$3)
+  `, [subId, method, amount]);
 
-await pool.query(`
-UPDATE users
-SET subscription_status='active',
-subscription_end=$1
-WHERE id=$2
-`,
-[endDate,userId]);
+  await pool.query(`
+    UPDATE users
+    SET subscription_status='active',
+        subscription_end=$1
+    WHERE id=$2
+  `, [endDate, userId]);
 
-return `Renewed until ${endDate}`;
+  return `✅ Renovado hasta ${endDate}`;
 }
 
 /* ======================
-   BUSINESS STATS
+   ADVANCED ANALYTICS
 ====================== */
 
-async function stats(){
+async function stats() {
 
-const active=await pool.query(`
-SELECT COUNT(*) FROM users
-WHERE subscription_status='active'
-`);
+  const active = await pool.query(`
+    SELECT COUNT(*) FROM users WHERE subscription_status='active'
+  `);
 
-const mrr=await pool.query(`
-SELECT COALESCE(SUM(amount),0) total
-FROM payments
-WHERE date_trunc('month',paid_at)=date_trunc('month',CURRENT_DATE)
-`);
+  const pending = await pool.query(`
+    SELECT COUNT(*) FROM users WHERE subscription_status='pending'
+  `);
 
-const avg=await pool.query(`
-SELECT COALESCE(AVG(amount),0) avg
-FROM payments
-`);
+  const expired = await pool.query(`
+    SELECT COUNT(*) FROM users WHERE subscription_status='expired'
+  `);
 
-return `
-Active users: ${active.rows[0].count}
+  const totalRevenue = await pool.query(`
+    SELECT COALESCE(SUM(amount),0) total FROM payments
+  `);
+
+  const mrr = await pool.query(`
+    SELECT COALESCE(SUM(amount),0) total
+    FROM payments
+    WHERE date_trunc('month',paid_at)=date_trunc('month',CURRENT_DATE)
+  `);
+
+  const avg = await pool.query(`
+    SELECT COALESCE(AVG(amount),0) avg FROM payments
+  `);
+
+  return `
+📊 BUSINESS ANALYTICS
+
+Active Users: ${active.rows[0].count}
+Pending Users: ${pending.rows[0].count}
+Expired Users: ${expired.rows[0].count}
+
+Total Revenue: $${totalRevenue.rows[0].total}
 MRR: $${mrr.rows[0].total}
-Avg Ticket: $${Number(avg.rows[0].avg).toFixed(2)}
+Average Ticket: $${Number(avg.rows[0].avg).toFixed(2)}
 `;
 }
 
@@ -210,50 +226,46 @@ Avg Ticket: $${Number(avg.rows[0].avg).toFixed(2)}
    DAILY CHECK
 ====================== */
 
-cron.schedule("0 9 * * *",async()=>{
+cron.schedule("0 9 * * *", async () => {
 
-console.log("Daily subscription check");
+  console.log("⏳ Daily subscription check");
 
-/* vencen hoy */
+  const expiring = await pool.query(`
+    SELECT telegram_id, username
+    FROM users
+    WHERE subscription_status='active'
+    AND subscription_end=CURRENT_DATE
+  `);
 
-const expiring=await pool.query(`
-SELECT telegram_id,username
-FROM users
-WHERE subscription_status='active'
-AND subscription_end=CURRENT_DATE
-`);
+  for (const u of expiring.rows) {
+    await sendMessage(
+      ADMIN_ID,
+      `⚠️ Vence hoy: ${u.username || u.telegram_id}`
+    );
+  }
 
-for(const u of expiring.rows){
-await sendMessage(
-ADMIN_ID,
-`⚠️ vence hoy: ${u.username||u.telegram_id}`
-);
-}
+  const expired = await pool.query(`
+    SELECT telegram_id, id, username
+    FROM users
+    WHERE subscription_status='active'
+    AND subscription_end <= CURRENT_DATE - INTERVAL '3 day'
+  `);
 
-/* remover tras 3 días */
+  for (const u of expired.rows) {
 
-const expired=await pool.query(`
-SELECT telegram_id,id
-FROM users
-WHERE subscription_status='active'
-AND subscription_end <= CURRENT_DATE - INTERVAL '3 day'
-`);
+    await removeFromGroup(u.telegram_id);
 
-for(const u of expired.rows){
+    await pool.query(`
+      UPDATE users
+      SET subscription_status='removed'
+      WHERE id=$1
+    `, [u.id]);
 
-await removeFromGroup(u.telegram_id);
-
-await pool.query(`
-UPDATE users
-SET subscription_status='inactive'
-WHERE id=$1
-`,[u.id]);
-
-await sendMessage(
-ADMIN_ID,
-`❌ removido por no renovar: ${u.telegram_id}`
-);
-}
+    await sendMessage(
+      ADMIN_ID,
+      `❌ Usuario removido: ${u.username || u.telegram_id}`
+    );
+  }
 
 });
 
@@ -261,104 +273,74 @@ ADMIN_ID,
    WEBHOOK
 ====================== */
 
-app.post("/webhook",async(req,res)=>{
+app.post("/webhook", async (req, res) => {
 
-const incomingSecret=
-req.headers["x-telegram-bot-api-secret-token"];
+  const incomingSecret =
+    req.headers["x-telegram-bot-api-secret-token"];
 
-if(incomingSecret!==SECRET_TOKEN)
-return res.sendStatus(403);
+  if (incomingSecret !== SECRET_TOKEN)
+    return res.sendStatus(403);
 
-const update=req.body;
+  const update = req.body;
 
-console.log("Webhook received:",JSON.stringify(update));
+  console.log("Webhook received");
 
-/* ======================
-   USER JOIN GROUP
-====================== */
+  if (update.message?.new_chat_members) {
 
-if(update.message?.new_chat_members){
+    for (const member of update.message.new_chat_members) {
 
-const chatId=update.message.chat.id;
+      if (member.is_bot) continue;
 
-if(!GROUP_ID){
-GROUP_ID=chatId;
-console.log("GROUP DETECTED:",GROUP_ID);
+      await registerUser(member);
+    }
 
-await sendMessage(
-ADMIN_ID,
-`✅ Grupo detectado automáticamente: ${GROUP_ID}`
-);
-}
+    return res.sendStatus(200);
+  }
 
-for(const member of update.message.new_chat_members){
+  if (!update.message) return res.sendStatus(200);
 
-if(member.is_bot) continue;
+  const msg = update.message;
 
-await registerUser(member);
+  if (msg.from.id !== ADMIN_ID)
+    return res.sendStatus(200);
 
-await sendMessage(
-ADMIN_ID,
-`✅ Usuario entró: ${member.username||member.id}`
-);
-}
+  const text = msg.text || "";
 
-return res.sendStatus(200);
-}
+  if (text.startsWith("/renew")) {
 
-/* ======================
-   ADMIN COMMANDS
-====================== */
+    const parts = text.split(" ");
+    const telegramId = parts[1];
+    const days = Number(parts[2]);
+    const amount = Number(parts[3] || 0);
 
-if(!update.message) return res.sendStatus(200);
+    const response =
+      await renewUser(telegramId, days, amount);
 
-const msg=update.message;
+    await sendMessage(msg.chat.id, response);
+  }
 
-if(msg.from.id!==ADMIN_ID)
-return res.sendStatus(200);
+  if (text === "/stats") {
+    const s = await stats();
+    await sendMessage(msg.chat.id, s);
+  }
 
-const text=msg.text||"";
-
-/* renew */
-
-if(text.startsWith("/renew")){
-
-const parts=text.split(" ");
-
-const telegramId=parts[1];
-const days=Number(parts[2]);
-const amount=Number(parts[3]||0);
-
-const response=
-await renewUser(telegramId,days,amount);
-
-await sendMessage(msg.chat.id,response);
-}
-
-/* stats */
-
-if(text==="/stats"){
-const s=await stats();
-await sendMessage(msg.chat.id,s);
-}
-
-res.sendStatus(200);
+  res.sendStatus(200);
 });
 
 /* ======================
    ROOT
 ====================== */
 
-app.get("/",(_,res)=>{
-res.send("Subscription Bot Running 🚀");
+app.get("/", (_, res) => {
+  res.send("Subscription Bot Running 🚀");
 });
 
 /* ======================
    START SERVER
 ====================== */
 
-const PORT=process.env.PORT||3000;
+const PORT = process.env.PORT || 3000;
 
-app.listen(PORT,()=>{
-console.log("Server running on port",PORT);
+app.listen(PORT, () => {
+  console.log("🚀 Server running on port", PORT);
 });
